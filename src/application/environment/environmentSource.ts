@@ -5,7 +5,15 @@ import {
   type AnalysisViewResult,
 } from "../../domain/analysisView/analysisView.js";
 import { scenarioCaptureRecords } from "../../domain/analysisView/scenarioCaptureRecords.js";
-import { readRecordedRequestLine } from "../../domain/analysisView/webNetworkRouteTemplates.js";
+import {
+  readRecordedResponseBody,
+  type RecordedResponseBody,
+} from "../../domain/analysisView/recordedResponseBody.js";
+import { isJsonLike } from "../../domain/analysisView/EnvironmentManifestAccumulator.js";
+import {
+  mediaTypeEssence,
+  readRecordedRequestLine,
+} from "../../domain/analysisView/webNetworkRouteTemplates.js";
 import { browserScenarioCaptureSchema } from "../../domain/browserScenarioCapture.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
@@ -13,11 +21,13 @@ import {
   type AnalysisInputIssue,
 } from "../../domain/analysisErrorCore.js";
 import { immutableEvidence, type Evidence } from "../../domain/evidence.js";
+import { parseExactJson } from "../../domain/exactJsonNumber.js";
 import { projectInputIssues } from "../../domain/inputIssueProjection.js";
 import { immutableJsonSnapshotMember } from "../../domain/immutableJson.js";
+import type { JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import {
-  webNetworkCaptureSchema,
+  safeParseOwnedWebNetworkCapture,
   type WebNetworkCaptureRecord,
 } from "../../domain/webNetworkCapture.js";
 
@@ -30,27 +40,64 @@ export type EnvironmentManifest = Extract<
 >;
 export type EnvironmentManifestTool = EnvironmentManifest["tools"][number];
 
-/** One retained parent record reduced to what a replay returns. */
-export interface RecordedExchange {
+/** One retained parent record reduced to what a replay returns; a cut body is reported truncated. */
+export interface RecordedExchange extends RecordedResponseBody {
   readonly ordinal: number;
   readonly path: string;
   /** WHATWG query spelling including `?`, or null when the request had none. */
   readonly query: string | null;
   readonly status: number | null;
   readonly contentType: string | null;
-  /** Producer-decoded response text, or null when the record retained none. */
-  readonly bodyText: string | null;
-  /** Set when the retained bytes are not UTF-8, so `bodyText` holds their base64 rather than a lossy decoding. */
-  readonly bodyEncoding?: "base64";
-  /** Set when only a prefix of a large base64 body was decoded; replay reports it truncated. */
-  readonly bodyCut?: true;
 }
 
 /** Replayed bodies larger than this are cut at a UTF-8 boundary and flagged. */
 export const REPLAY_BODY_LIMIT_BYTES = 256 * 1024;
 
-/** Base64 characters that decode to just over the replay limit, so a cut prefix still fills it. */
-const BASE64_PREFIX_CHARS = Math.ceil((REPLAY_BODY_LIMIT_BYTES + 4) / 3) * 4;
+/** How replay answers with an exchange's body; replay and tool descriptions both read it from here. */
+export type ReplayedBody =
+  | { readonly kind: "none" }
+  /** Non-UTF-8 bytes as base64; `whole` when every recorded byte fits the replay limit. */
+  | {
+      readonly kind: "base64";
+      readonly encoded: string;
+      readonly whole: boolean;
+    }
+  /** UTF-8 text over the replay limit or cut when retained; replay answers with a prefix. */
+  | { readonly kind: "cut"; readonly text: string }
+  | { readonly kind: "json"; readonly value: JsonValue }
+  | { readonly kind: "text"; readonly text: string };
+
+/** Bytes a padded base64 string decodes to. */
+const decodedBase64Bytes = (encoded: string): number =>
+  Math.floor((encoded.length * 3) / 4) -
+  (encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0);
+
+/** Classify a retained body once: whole JSON-like UTF-8 text within the limit that parses exactly is JSON. */
+export const replayedBody = (exchange: RecordedExchange): ReplayedBody => {
+  const text = exchange.bodyText;
+  if (text === null) return { kind: "none" };
+  if (exchange.bodyEncoding === "base64")
+    return {
+      kind: "base64",
+      encoded: text,
+      whole:
+        exchange.bodyCut !== true &&
+        decodedBase64Bytes(text) <= REPLAY_BODY_LIMIT_BYTES,
+    };
+  if (
+    exchange.bodyCut === true ||
+    // UTF-8 never takes fewer bytes than UTF-16 units, so the length check avoids encoding huge text.
+    text.length > REPLAY_BODY_LIMIT_BYTES ||
+    Buffer.byteLength(text, "utf8") > REPLAY_BODY_LIMIT_BYTES
+  )
+    return { kind: "cut", text };
+  const value =
+    exchange.contentType !== null &&
+    isJsonLike(mediaTypeEssence(exchange.contentType))
+      ? parseExactJson(text)
+      : undefined;
+  return value === undefined ? { kind: "text", text } : { kind: "json", value };
+};
 
 /** A HAR inspected by inspect_web_network_capture, or a session recorded by capture_browser_scenario. */
 export type EnvironmentCaptureKind = "web-network-capture" | "browser-scenario";
@@ -71,7 +118,8 @@ export interface EnvironmentSource {
   readonly exchanges: ReadonlyMap<number, RecordedExchange>;
 }
 
-const inputError = (
+/** An input refusal whose issue paths name the offending file. */
+export const inputError = (
   operation: string,
   issues: readonly AnalysisInputIssue[],
   userMessage?: string,
@@ -83,9 +131,9 @@ const inputError = (
   );
 
 /** Authenticate one Evidence file; schema failures name the file role in their paths. */
-const parseEvidenceFile = (
+export const parseEvidenceFile = (
   operation: string,
-  role: "manifest" | "evidence",
+  role: "manifest" | "evidence" | "state",
   value: unknown,
 ): Result<Evidence, AnalysisError> => {
   try {
@@ -107,52 +155,6 @@ const parseEvidenceFile = (
   }
 };
 
-const contentTextSchema = z.object({
-  response: z.object({
-    content: z.object({
-      text: z.unknown().optional(),
-      encoding: z.unknown().optional(),
-    }),
-  }),
-});
-
-/** Strict, and keeping a leading byte-order mark, so replay returns the recorded text unchanged. */
-const strictUtf8 = (): TextDecoder =>
-  new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-
-/** The retained response text of one record, decoding HAR base64 content when the decoder kept it as valid UTF-8. */
-const recordedBody = (
-  record: WebNetworkCaptureRecord,
-): Pick<RecordedExchange, "bodyText" | "bodyEncoding"> => {
-  const content = contentTextSchema.safeParse(record.reported);
-  if (!content.success) return { bodyText: null };
-  const { text, encoding } = content.data.response.content;
-  if (typeof text !== "string") return { bodyText: null };
-  if (encoding !== "base64") return { bodyText: text };
-  const binary = record.binary_fields.find(
-    (field) =>
-      field.pointer === "/response/content/text" && field.state === "retained",
-  );
-  if (binary === undefined || binary.content_base64 === null)
-    return { bodyText: null };
-  // Replay returns at most REPLAY_BODY_LIMIT_BYTES, so a large body is decoded only that far.
-  const cut = binary.content_base64.length > BASE64_PREFIX_CHARS;
-  const encoded = cut
-    ? binary.content_base64.slice(0, BASE64_PREFIX_CHARS)
-    : binary.content_base64;
-  const flags = cut ? { bodyCut: true as const } : {};
-  try {
-    // A cut prefix may end inside a character; streaming leaves that tail undecoded.
-    const text = strictUtf8().decode(Buffer.from(encoded, "base64"), {
-      stream: cut,
-    });
-    return { bodyText: text, ...flags };
-  } catch {
-    // Binary or non-UTF-8 bytes: keep them exactly, as base64, instead of inventing replacement characters.
-    return { bodyText: encoded, bodyEncoding: "base64", ...flags };
-  }
-};
-
 const recordedExchange = (
   record: WebNetworkCaptureRecord,
 ): RecordedExchange | undefined => {
@@ -164,19 +166,24 @@ const recordedExchange = (
     query: line.query === undefined || line.query === "" ? null : line.query,
     status: line.status,
     contentType: line.rawMime === "" ? null : line.rawMime,
-    ...recordedBody(record),
+    ...readRecordedResponseBody(record, REPLAY_BODY_LIMIT_BYTES),
   };
 };
 
-/** Authenticate the manifest file and require the environment-manifest view kind. */
-const parseManifestEvidence = (
+/** Authenticate a view Evidence file and require one view kind; a refusal names the file role. */
+export const parseViewEvidence = <Kind extends AnalysisViewResult["kind"]>(
   operation: string,
+  role: "manifest" | "state",
   value: unknown,
+  kind: Kind,
 ): Result<
-  { readonly manifest: EnvironmentManifest; readonly evidenceId: string },
+  {
+    readonly view: Extract<AnalysisViewResult, { kind: Kind }>;
+    readonly evidenceId: string;
+  },
   AnalysisError
 > => {
-  const evidence = parseEvidenceFile(operation, "manifest", value);
+  const evidence = parseEvidenceFile(operation, role, value);
   if (!evidence.ok) return evidence;
   const view = analysisViewResultSchema.safeParse(
     evidence.value.normalized_result,
@@ -184,24 +191,26 @@ const parseManifestEvidence = (
   if (
     evidence.value.operation !== "inspect_analysis_view" ||
     !view.success ||
-    view.data.kind !== "environment-manifest"
+    view.data.kind !== kind
   )
     return err(
       inputError(
         operation,
         [
           {
-            path: ["manifest", "normalized_result", "kind"],
+            path: [role, "normalized_result", "kind"],
             reason: "invalid_value",
-            expected: "environment-manifest",
-            message:
-              "The manifest file must be inspect_analysis_view Evidence of kind environment-manifest.",
+            expected: kind,
+            message: `The ${role} file must be inspect_analysis_view Evidence of kind ${kind}.`,
           },
         ],
-        "The manifest file is not environment-manifest view Evidence.",
+        `The ${role} file is not ${kind} view Evidence.`,
       ),
     );
-  return ok({ manifest: view.data, evidenceId: evidence.value.evidence_id });
+  return ok({
+    view: view.data as Extract<AnalysisViewResult, { kind: Kind }>,
+    evidenceId: evidence.value.evidence_id,
+  });
 };
 
 /** Authenticate the evidence file and require complete capture Evidence of either kind. */
@@ -245,7 +254,8 @@ const parseCaptureEvidence = (
         const record = immutableJsonSnapshotMember(records, String(index));
         immutableJsonSnapshotMember(record, "reported");
       }
-    const capture = webNetworkCaptureSchema.safeParse(normalized);
+    // An owned snapshot is validated once and borrowed, so deriving the state reuses this validation.
+    const capture = safeParseOwnedWebNetworkCapture(normalized);
     if (capture.success) {
       // The manifest view projects HAR captures only, and replay reads HAR's response fields.
       if (capture.data.format !== "har")
@@ -320,11 +330,16 @@ export const loadEnvironmentSource = (
   evidenceValue: unknown,
   operation: string = ENVIRONMENT_SERVE_OPERATION,
 ): Result<EnvironmentSource, AnalysisError> => {
-  const manifest = parseManifestEvidence(operation, manifestValue);
+  const manifest = parseViewEvidence(
+    operation,
+    "manifest",
+    manifestValue,
+    "environment-manifest",
+  );
   if (!manifest.ok) return manifest;
   const capture = parseCaptureEvidence(operation, evidenceValue);
   if (!capture.ok) return capture;
-  const parentId = manifest.value.manifest.parent_evidence_id;
+  const parentId = manifest.value.view.parent_evidence_id;
   if (parentId !== capture.value.evidenceId)
     return err(
       inputError(
@@ -341,11 +356,11 @@ export const loadEnvironmentSource = (
       ),
     );
   return ok({
-    manifest: manifest.value.manifest,
+    manifest: manifest.value.view,
     manifestEvidenceId: manifest.value.evidenceId,
     evidenceId: capture.value.evidenceId,
     captureKind: capture.value.captureKind,
     captureSha256: capture.value.captureSha256,
-    exchanges: indexExchanges(manifest.value.manifest, capture.value.records),
+    exchanges: indexExchanges(manifest.value.view, capture.value.records),
   });
 };
